@@ -13,6 +13,7 @@ const Wallet = require('../models/fiatwallets');
 const Transaction = require('../models/Transaction');
 const User = require('../models/user');
 const authMiddleware = require('../middleware/auth');
+const Order = require('../models/TradeOrder');
 
 // Fireblocks Configuration
 const secretPath = path.resolve('fireblocks_secret6.key');
@@ -324,12 +325,12 @@ router.post('/CryptoAmountUpdate', authMiddleware, async (req, res) => {
 });
 
 // New Route: Sell Crypto
+// Updated Sell Crypto Route (Handles Market Orders)
 router.post('/sellCrypto', authMiddleware, async (req, res) => {
   const { cryptoWalletId, fiatWalletId, cryptoAmount, fiatAmount, cryptoCurrency } = req.body;
   const userId = req.user.userId;
 
   try {
-    // Validate request body
     if (!cryptoWalletId || !fiatWalletId || !cryptoAmount || !fiatAmount || !cryptoCurrency) {
       return res.status(400).json({
         status: 400,
@@ -337,15 +338,11 @@ router.post('/sellCrypto', authMiddleware, async (req, res) => {
       });
     }
 
-    // Start Mongo session and transaction
     const session = await mongoose.startSession();
     session.startTransaction();
 
     try {
-      // Fetch crypto wallet
       const cryptoWallet = await CryptoWalletAddress.findById(cryptoWalletId).session(session);
-      console.log("Fetched Crypto Wallet:", cryptoWallet);
-
       if (!cryptoWallet || !cryptoWallet.userId.equals(userId)) {
         await session.abortTransaction();
         return res.status(404).json({
@@ -354,7 +351,6 @@ router.post('/sellCrypto', authMiddleware, async (req, res) => {
         });
       }
 
-      // Validate crypto balance
       if (cryptoWallet.balance < cryptoAmount) {
         await session.abortTransaction();
         return res.status(400).json({
@@ -363,10 +359,7 @@ router.post('/sellCrypto', authMiddleware, async (req, res) => {
         });
       }
 
-      // Fetch fiat wallet
       const fiatWallet = await Wallet.findById(fiatWalletId).session(session);
-      console.log("Fetched Fiat Wallet:", fiatWallet);
-
       if (!fiatWallet || !fiatWallet.userId.equals(userId)) {
         await session.abortTransaction();
         return res.status(404).json({
@@ -375,14 +368,12 @@ router.post('/sellCrypto', authMiddleware, async (req, res) => {
         });
       }
 
-      // Update wallet balances
       cryptoWallet.balance -= cryptoAmount;
       fiatWallet.balance += fiatAmount;
 
       await cryptoWallet.save({ session });
       await fiatWallet.save({ session });
 
-      // Create transaction
       const transaction = new Transaction({
         userId,
         amount: cryptoAmount,
@@ -398,6 +389,19 @@ router.post('/sellCrypto', authMiddleware, async (req, res) => {
       });
 
       await transaction.save({ session });
+
+      const order = new Order({
+        userId,
+        coinName: cryptoCurrency,
+        orderType: 'Market',
+        side: 'Sell',
+        amount: cryptoAmount,
+        price: fiatAmount / cryptoAmount, // Market price
+        status: 'Filled',
+        executedAt: new Date(),
+      });
+
+      await order.save({ session });
       await session.commitTransaction();
 
       return res.status(200).json({
@@ -414,9 +418,17 @@ router.post('/sellCrypto', authMiddleware, async (req, res) => {
             currency: fiatWallet.currency,
             balance: fiatWallet.balance,
           },
+          order: {
+            _id: order._id,
+            coinName: order.coinName,
+            orderType: order.orderType,
+            side: order.side,
+            amount: order.amount,
+            price: order.price,
+            status: order.status,
+          },
         },
       });
-
     } catch (error) {
       await session.abortTransaction();
       console.error('Error in sell transaction:', error.message);
@@ -428,7 +440,6 @@ router.post('/sellCrypto', authMiddleware, async (req, res) => {
     } finally {
       session.endSession();
     }
-
   } catch (error) {
     console.error('Error in sell crypto route:', error.message);
     return res.status(500).json({
@@ -438,6 +449,7 @@ router.post('/sellCrypto', authMiddleware, async (req, res) => {
     });
   }
 });
+
 
 
 async function getVaultAccountByName(email) {
@@ -879,5 +891,332 @@ router.get('/fetchCompleteCryptoDetails', authMiddleware, async (req, res) => {
     });
   }
 });
+
+// New Route: Place Order (Market, Limit, Stop-Loss)
+router.post('/placeOrder', authMiddleware, async (req, res) => {
+  const { cryptoWalletId, fiatWalletId, coinName, orderType, side, amount, price, stopPrice } = req.body;
+  const userId = req.user.userId;
+
+  try {
+    if (!cryptoWalletId || !fiatWalletId || !coinName || !orderType || !side || !amount) {
+      return res.status(400).json({
+        status: 400,
+        message: 'Missing required parameters',
+      });
+    }
+
+    if (orderType === 'Limit' && !price) {
+      return res.status(400).json({
+        status: 400,
+        message: 'Price is required for Limit orders',
+      });
+    }
+
+    if (orderType === 'Stop-Loss' && (!price || !stopPrice)) {
+      return res.status(400).json({
+        status: 400,
+        message: 'Price and stopPrice are required for Stop-Loss orders',
+      });
+    }
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+      const cryptoWallet = await CryptoWalletAddress.findById(cryptoWalletId).session(session);
+      if (!cryptoWallet || !cryptoWallet.userId.equals(userId)) {
+        await session.abortTransaction();
+        return res.status(404).json({
+          status: 404,
+          message: 'Crypto wallet not found or unauthorized',
+        });
+      }
+
+      const fiatWallet = await Wallet.findById(fiatWalletId).session(session);
+      if (!fiatWallet || !fiatWallet.userId.equals(userId)) {
+        await session.abortTransaction();
+        return res.status(404).json({
+          status: 404,
+          message: 'Fiat wallet not found or unauthorized',
+        });
+      }
+
+      // Validate balances
+      if (side === 'Buy' && fiatWallet.balance < (amount * price || 0)) {
+        await session.abortTransaction();
+        return res.status(400).json({
+          status: 400,
+          message: 'Insufficient fiat balance for Buy order',
+        });
+      }
+
+      if (side === 'Sell' && cryptoWallet.balance < amount) {
+        await session.abortTransaction();
+        return res.status(400).json({
+          status: 400,
+          message: 'Insufficient crypto balance for Sell order',
+        });
+      }
+
+      // For Market orders, execute immediately
+      if (orderType === 'Market') {
+        // Mapping Coinbase pair to CoinGecko ID
+        const coinGeckoIdMap = {
+          'BTC-USD': 'bitcoin',
+          'ETH-USD': 'ethereum',
+          'XRP-USD': 'ripple',
+          'ADA-USD': 'cardano',
+          'SOL-USD': 'solana',
+          'DOT-USD': 'polkadot',
+          'DOGE-USD': 'dogecoin',
+          'BNB-USD': 'binancecoin',
+          'LINK-USD': 'chainlink',
+          'AVAX-USD': 'avalanche-2',
+        };
+        const coinGeckoId = coinGeckoIdMap[coinName] || coinName.split('-')[0].toLowerCase();
+
+        const response = await axios.get('https://api.coingecko.com/api/v3/simple/price', {
+          params: {
+            ids: coinGeckoId,
+            vs_currencies: 'usd',
+          },
+        });
+
+        const marketPrice = response.data[coinGeckoId]?.usd;
+        if (!marketPrice) {
+          await session.abortTransaction();
+          return res.status(500).json({
+            status: 500,
+            message: 'Failed to fetch market price',
+          });
+        }
+
+        if (side === 'Buy') {
+          fiatWallet.balance -= amount * marketPrice;
+          cryptoWallet.balance += amount;
+        } else {
+          cryptoWallet.balance -= amount;
+          fiatWallet.balance += amount * marketPrice;
+        }
+
+        await cryptoWallet.save({ session });
+        await fiatWallet.save({ session });
+
+        const transaction = new Transaction({
+          userId,
+          amount,
+          currency: coinName,
+          type: side.toLowerCase(),
+          status: 'success',
+          gateway: 'internal',
+          gatewayId: `market_${cryptoWalletId}_${Date.now()}`,
+          walletAddress: cryptoWallet.walletAddress,
+          fiatAmount: amount * marketPrice,
+          fiatCurrency: fiatWallet.currency,
+          createdAt: new Date(),
+        });
+
+        await transaction.save({ session });
+
+        const order = new Order({
+          userId,
+          coinName,
+          orderType,
+          side,
+          amount,
+          price: marketPrice,
+          status: 'Filled',
+          executedAt: new Date(),
+        });
+
+        await order.save({ session });
+        await session.commitTransaction();
+
+        return res.status(200).json({
+          status: 200,
+          message: `${side} order executed successfully`,
+          data: {
+            order: {
+              _id: order._id,
+              coinName: order.coinName,
+              orderType: order.orderType,
+              side: order.side,
+              amount: order.amount,
+              price: order.price,
+              status: order.status,
+            },
+          },
+        });
+      } else {
+        // For Limit/Stop-Loss, store order in DB
+        const order = new Order({
+          userId,
+          coinName,
+          orderType,
+          side,
+          amount,
+          price,
+          stopPrice: orderType === 'Stop-Loss' ? stopPrice : null,
+          status: 'Open',
+        });
+
+        await order.save({ session });
+        await session.commitTransaction();
+
+        // Mock matching engine (replace with real logic)
+        setTimeout(async () => {
+          const session = await mongoose.startSession();
+          session.startTransaction();
+          try {
+            const updatedOrder = await Order.findById(order._id).session(session);
+            if (!updatedOrder || updatedOrder.status !== 'Open') {
+              await session.commitTransaction();
+              session.endSession();
+              return;
+            }
+
+            const coinGeckoId = coinGeckoIdMap[coinName] || coinName.split('-')[0].toLowerCase();
+            const response = await axios.get('https://api.coingecko.com/api/v3/simple/price', {
+              params: {
+                ids: coinGeckoId,
+                vs_currencies: 'usd',
+              },
+            });
+
+            const marketPrice = response.data[coinGeckoId]?.usd;
+            if (!marketPrice) {
+              await session.commitTransaction();
+              session.endSession();
+              return;
+            }
+
+            let shouldExecute = false;
+            if (orderType === 'Limit') {
+              if (side === 'Buy' && marketPrice <= price) shouldExecute = true;
+              if (side === 'Sell' && marketPrice >= price) shouldExecute = true;
+            } else if (orderType === 'Stop-Loss' && side === 'Sell') {
+              if (marketPrice <= stopPrice) shouldExecute = true;
+            }
+
+            if (shouldExecute) {
+              const cryptoWallet = await CryptoWalletAddress.findById(cryptoWalletId).session(session);
+              const fiatWallet = await Wallet.findById(fiatWalletId).session(session);
+
+              if (side === 'Buy') {
+                fiatWallet.balance -= amount * marketPrice;
+                cryptoWallet.balance += amount;
+              } else {
+                cryptoWallet.balance -= amount;
+                fiatWallet.balance += amount * marketPrice;
+              }
+
+              await cryptoWallet.save({ session });
+              await fiatWallet.save({ session });
+
+              updatedOrder.status = 'Filled';
+              updatedOrder.price = marketPrice;
+              updatedOrder.executedAt = new Date();
+              await updatedOrder.save({ session });
+
+              const transaction = new Transaction({
+                userId,
+                amount,
+                currency: coinName,
+                type: side.toLowerCase(),
+                status: 'success',
+                gateway: 'internal',
+                gatewayId: `limit_${cryptoWalletId}_${Date.now()}`,
+                walletAddress: cryptoWallet.walletAddress,
+                fiatAmount: amount * marketPrice,
+                fiatCurrency: fiatWallet.currency,
+                createdAt: new Date(),
+              });
+
+              await transaction.save({ session });
+              await session.commitTransaction();
+            } else {
+              await session.commitTransaction();
+            }
+          } catch (error) {
+            await session.abortTransaction();
+            console.error('Error matching order:', error.message);
+          } finally {
+            session.endSession();
+          }
+        }, 5000); // Check every 5 seconds (mock matching engine)
+
+        return res.status(200).json({
+          status: 200,
+          message: `${orderType} ${side} order placed successfully`,
+          data: {
+            order: {
+              _id: order._id,
+              coinName: order.coinName,
+              orderType: order.orderType,
+              side: order.side,
+              amount: order.amount,
+              price: order.price,
+              stopPrice: order.stopPrice,
+              status: order.status,
+            },
+          },
+        });
+      }
+    } catch (error) {
+      await session.abortTransaction();
+      console.error('Error placing order:', error.message);
+      return res.status(500).json({
+        status: 500,
+        message: 'Failed to place order',
+        error: error.message,
+      });
+    } finally {
+      session.endSession();
+    }
+  } catch (error) {
+    console.error('Error in place order route:', error.message);
+    return res.status(500).json({
+      status: 500,
+      message: 'Internal server error',
+      error: error.message,
+    });
+  }
+});
+
+
+// Fetch Orders
+  router.get('/fetchSpotOrders', authMiddleware, async (req, res) => {
+    try {
+      const userId = req.user.userId;
+      console.log('Fetching orders for user:', userId);
+
+      const orders = await Order.find({ userId })
+        .select('coinName orderType side amount price stopPrice status executedAt createdAt -_id')
+        .sort({ createdAt: -1 });
+
+      if (!orders || orders.length === 0) {
+        console.log('No orders found for user:', userId);
+        return res.status(404).json({
+          status: 404,
+          message: 'No orders found',
+          data: [],
+        });
+      }
+
+      res.status(200).json({
+        status: 200,
+        message: 'Orders fetched successfully',
+        data: orders,
+      });
+    } catch (error) {
+      console.error('Error fetching orders:', error.message);
+      res.status(500).json({
+        status: 500,
+        message: 'Failed to fetch orders',
+        error: error.message,
+      });
+    }
+  });
+
 
 module.exports = router;
