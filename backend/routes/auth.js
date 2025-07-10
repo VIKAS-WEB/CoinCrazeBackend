@@ -11,9 +11,8 @@ router.post('/signup', async (req, res) => {
     if (existingUser) {
       return res.status(400).json({ error: 'Email already exists' });
     }
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const user = new User({ email, phoneNumber, password: hashedPassword });
-    await user.save();
+    const user = new User({ email, phoneNumber, password }); // Plain password
+    await user.save(); // pre('save') hook hash karega
     const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '24h' });
     res.status(201).json({ message: 'User created successfully', token, user });
   } catch (err) {
