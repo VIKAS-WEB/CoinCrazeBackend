@@ -600,6 +600,7 @@ router.post('/create', authMiddleware, async (req, res) => {
 });
 
 // Add Funds (Stripe)
+// Add Funds (Stripe)
 router.post('/add-money/stripe', authMiddleware, async (req, res) => {
   try {
     const { amount, currency } = req.body;
@@ -610,6 +611,9 @@ router.post('/add-money/stripe', authMiddleware, async (req, res) => {
       currency,
       metadata: { userId },
     });
+    console.log('PaymentIntent ID:', paymentIntent.id);
+    console.log('Client Secret:', paymentIntent.client_secret);
+    console.log('Full PaymentIntent:', JSON.stringify(paymentIntent, null, 2));
 
     const transaction = new Transaction({
       userId,
@@ -619,12 +623,54 @@ router.post('/add-money/stripe', authMiddleware, async (req, res) => {
       status: 'pending',
       gateway: 'stripe',
       gatewayId: paymentIntent.id,
+      walletType: 'fiat',
     });
     await transaction.save();
 
     res.json({ clientSecret: paymentIntent.client_secret });
   } catch (err) {
     console.error('Error in Stripe payment:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Confirm Payment Endpoint
+router.post('/confirm-payment', authMiddleware, async (req, res) => {
+  try {
+    const { clientSecret } = req.body;
+    const paymentIntentId = clientSecret.split('_secret_')[0]; // Extract PI ID
+
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+    console.log('PaymentIntent:', JSON.stringify(paymentIntent, null, 2));
+    const userId = paymentIntent.metadata.userId;
+    const amount = paymentIntent.amount / 100; // Convert back to original currency
+    const gatewayId = paymentIntent.id;
+
+    if (paymentIntent.status === 'succeeded') {
+      // Update transaction status
+      const transaction = await Transaction.findOneAndUpdate(
+        { userId, gatewayId, status: 'pending' },
+        { status: 'succeeded', updatedAt: new Date() },
+        { new: true }
+      );
+
+      if (transaction) {
+        console.log(`Transaction ${gatewayId} updated to succeeded for user ${userId}`);
+        // Update wallet balance
+        await Wallet.findOneAndUpdate(
+          { userId, currency: paymentIntent.currency },
+          { $inc: { balance: amount }, updatedAt: new Date() },
+          { upsert: true, new: true }
+        );
+        console.log(`Wallet balance updated for user ${userId} with ${amount} ${paymentIntent.currency}`);
+      }
+
+      res.json({ success: true, message: 'Payment confirmed' });
+    } else {
+      res.status(400).json({ error: 'Payment not successful' });
+    }
+  } catch (err) {
+    console.error('Error confirming payment:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1185,38 +1231,38 @@ router.post('/placeOrder', authMiddleware, async (req, res) => {
 
 
 // Fetch Orders
-  router.get('/fetchSpotOrders', authMiddleware, async (req, res) => {
-    try {
-      const userId = req.user.userId;
-      console.log('Fetching orders for user:', userId);
+router.get('/fetchSpotOrders', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    console.log('Fetching orders for user:', userId);
 
-      const orders = await Order.find({ userId })
-        .select('coinName orderType side amount price stopPrice status executedAt createdAt -_id')
-        .sort({ createdAt: -1 });
+    const orders = await Order.find({ userId })
+      .select('coinName orderType side amount price stopPrice status executedAt createdAt -_id')
+      .sort({ createdAt: -1 });
 
-      if (!orders || orders.length === 0) {
-        console.log('No orders found for user:', userId);
-        return res.status(404).json({
-          status: 404,
-          message: 'No orders found',
-          data: [],
-        });
-      }
-
-      res.status(200).json({
-        status: 200,
-        message: 'Orders fetched successfully',
-        data: orders,
-      });
-    } catch (error) {
-      console.error('Error fetching orders:', error.message);
-      res.status(500).json({
-        status: 500,
-        message: 'Failed to fetch orders',
-        error: error.message,
+    if (!orders || orders.length === 0) {
+      console.log('No orders found for user:', userId);
+      return res.status(404).json({
+        status: 404,
+        message: 'No orders found',
+        data: [],
       });
     }
-  });
+
+    res.status(200).json({
+      status: 200,
+      message: 'Orders fetched successfully',
+      data: orders,
+    });
+  } catch (error) {
+    console.error('Error fetching orders:', error.message);
+    res.status(500).json({
+      status: 500,
+      message: 'Failed to fetch orders',
+      error: error.message,
+    });
+  }
+});
 
 
 module.exports = router;
