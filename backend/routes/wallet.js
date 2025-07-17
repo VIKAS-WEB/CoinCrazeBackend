@@ -677,34 +677,92 @@ router.post('/confirm-payment', authMiddleware, async (req, res) => {
 
 // Add Funds (Razorpay)
 router.post('/add-money/razorpay', authMiddleware, async (req, res) => {
+  console.log('Entering /add-money/razorpay request:', {
+    body: req.body,
+    headers: req.headers,
+    user: req.user,
+  });
+
   try {
     const { amount, currency } = req.body;
-    const userId = req.user.userId;
+    const userId = req.user?.userId;
 
-    const order = await razorpay.orders.create({
-      amount: amount * 100, // Convert to paise
-      currency,
-      receipt: `receipt_${userId}_${Date.now()}`,
-    });
+    // Validate inputs
+    if (!userId) {
+      console.error('Validation Error: userId not found in req.user');
+      return res.status(401).json({ error: 'User ID not found in token' });
+    }
+    if (!amount || !currency) {
+      console.error('Validation Error: Missing amount or currency', req.body);
+      return res.status(400).json({ error: 'Amount and currency are required' });
+    }
+    if (typeof amount !== 'number' || isNaN(amount) || amount <= 0) {
+      console.error('Validation Error: Invalid amount', { amount });
+      return res.status(400).json({ error: 'Amount must be a positive number' });
+    }
+    if (!['INR'].includes(currency.toUpperCase())) {
+      console.error('Validation Error: Unsupported currency', { currency });
+      return res.status(400).json({ error: 'Only INR supported in Test Mode' });
+    }
 
-    const transaction = new Transaction({
-      userId,
-      amount,
-      currency,
-      type: 'deposit',
-      status: 'pending',
-      gateway: 'razorpay',
-      gatewayId: order.id,
-    });
-    await transaction.save();
+    // Validate Razorpay keys
+    if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+      console.error('Razorpay Config Error: Missing API keys');
+      return res.status(500).json({ error: 'Razorpay configuration error' });
+    }
 
-    res.json({ orderId: order.id, key: process.env.RAZORPAY_KEY_ID });
+    console.log('Creating Razorpay order:', { userId, amount, currency });
+
+    // Generate receipt (max 40 characters)
+    const receipt = `rcpt_${userId.slice(0, 20)}_${Date.now().toString().slice(-8)}`;
+    console.log('Generated Receipt:', { receipt, length: receipt.length });
+
+    // Create Razorpay order
+    let order;
+    try {
+      order = await razorpay.orders.create({
+        amount: Math.round(amount * 100), // Convert to paise
+        currency: currency.toUpperCase(),
+        receipt,
+      });
+      console.log('Razorpay Order Created:', order);
+
+      // Save transaction
+      const transaction = new Transaction({
+        userId,
+        amount,
+        currency,
+        type: 'deposit',
+        status: 'pending',
+        gateway: 'razorpay',
+        gatewayId: order.id,
+      });
+      console.log('Saving Transaction:', transaction);
+      await transaction.save();
+      console.log('Transaction Saved:', transaction._id);
+
+      res.json({ orderId: order.id, key: process.env.RAZORPAY_KEY_ID });
+    } catch (razorpayErr) {
+      console.error('Razorpay API Error:', {
+        error: razorpayErr,
+        message: razorpayErr.message || razorpayErr.error?.description || 'No error message provided',
+        status: razorpayErr.statusCode,
+        code: razorpayErr.error?.code,
+        description: razorpayErr.error?.description,
+      });
+      return res.status(400).json({
+        error: razorpayErr.error?.description || 'Failed to create Razorpay order',
+      });
+    }
   } catch (err) {
-    console.error('Error in Razorpay payment:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Razorpay Payment Error:', {
+      message: err.message || 'No error message',
+      stack: err.stack || 'No stack trace',
+      requestBody: req.body,
+    });
+    return res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
-
 // Webhook for Stripe
 router.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
